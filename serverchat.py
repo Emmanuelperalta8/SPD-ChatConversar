@@ -1,73 +1,92 @@
 import socket
 import multiprocessing
+import datetime
 
 MAX_CLIENTS = 10
-lock = multiprocessing.Lock()
+MAX_MSG_LENGTH = 200  # limite de caracteres por mensagem
 
-# Lista de clientes conectados
-def process_request(client_socket, addr, all_clients):
-    global lock
+def log(message):
+    timestamp = datetime.datetime.now().strftime("[%H:%M:%S]")
+    print(f"{timestamp} {message}")
 
-    print(f"Cliente {addr} conectado.")
-    
-    # Envia mensagem inicial
-    client_socket.send("Conectado ao servidor. Você pode começar a conversar.".encode())
+def process_request(client_socket, addr, all_clients, nicknames, lock):
+    try:
+        client_socket.send("Digite seu apelido: ".encode())
+        nickname = client_socket.recv(1024).decode().strip()
 
-    while True:
-        try:
-            # Recebe a mensagem do cliente
-            message = client_socket.recv(1024).decode()
+        if not nickname:
+            nickname = f"{addr[0]}:{addr[1]}"
+
+        with lock:
+            nicknames[client_socket.fileno()] = nickname
+
+        log(f"{nickname} ({addr}) conectado.")
+
+        client_socket.send("Conectado ao servidor. Você pode começar a conversar.".encode())
+
+        while True:
+            message = client_socket.recv(1024).decode().strip()
             if not message:
                 break
 
-            print(f"Mensagem recebida de {addr}: {message}")
+            if len(message) > MAX_MSG_LENGTH:
+                client_socket.send(f"⚠️ Sua mensagem ultrapassou {MAX_MSG_LENGTH} caracteres.".encode())
+                continue
 
             if message.lower() == "sair":
-                print(f"Cliente {addr} solicitou desconexão.")
+                log(f"{nickname} desconectou.")
                 break
 
-            # Envia a mensagem para todos os clientes conectados
+            log(f"{nickname}: {message}")
+
             with lock:
                 for c in all_clients:
-                    try:
-                        c.send(f"Mensagem de {addr}: {message}".encode())  # Envia para todos os clientes
-                    except Exception as e:
-                        print(f"Erro ao enviar para o cliente {c.getpeername()}: {e}")
+                    if c != client_socket:
+                        try:
+                            c.send(f"{nickname}: {message}".encode())
+                        except Exception as e:
+                            log(f"Erro ao enviar para {c.getpeername()}: {e}")
 
-        except Exception as e:
-            print(f"Erro durante a comunicação com {addr}: {e}")
-            break
+    except Exception as e:
+        log(f"Erro com {addr}: {e}")
 
-    # Remove o cliente da lista ao desconectar
-    with lock:
-        all_clients.remove(client_socket)
-
-    print(f"Cliente {addr} desconectado.")
-    client_socket.close()
+    finally:
+        with lock:
+            if client_socket in all_clients:
+                all_clients.remove(client_socket)
+            nicknames.pop(client_socket.fileno(), None)
+        client_socket.close()
 
 def start_server(host='0.0.0.0', port=12345):
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind((host, port))
     server.listen(5)
-    print(f"Servidor ouvindo em {host}:{port}")
+    log(f"Servidor ouvindo em {host}:{port}")
 
     manager = multiprocessing.Manager()
-    all_clients = manager.list()  # Lista compartilhada de clientes conectados
+    all_clients = manager.list()
+    nicknames = manager.dict()
+    lock = manager.Lock()
 
     while True:
         client_socket, addr = server.accept()
 
         with lock:
             if len(all_clients) >= MAX_CLIENTS:
-                print(f"Servidor cheio! Recusando conexão de {addr}.")
-                client_socket.send("Servidor cheio. Tente novamente mais tarde.".encode())
+                log(f"Servidor cheio! Recusando {addr}")
+                try:
+                    client_socket.send("Servidor cheio. Tente novamente mais tarde.".encode())
+                except:
+                    pass
                 client_socket.close()
                 continue
             all_clients.append(client_socket)
 
-        # Cria um processo para cada cliente
-        client_process = multiprocessing.Process(target=process_request, args=(client_socket, addr, all_clients))
-        client_process.daemon = True  # Permite que o processo filho seja finalizado quando o pai terminar
+        client_process = multiprocessing.Process(
+            target=process_request,
+            args=(client_socket, addr, all_clients, nicknames, lock)
+        )
+        client_process.daemon = True
         client_process.start()
 
 if __name__ == "__main__":
